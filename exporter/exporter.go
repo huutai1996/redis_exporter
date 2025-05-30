@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"container/heap"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,8 +35,7 @@ type Exporter struct {
 	totalScrapes              prometheus.Counter
 	scrapeDuration            prometheus.Summary
 	targetScrapeRequestErrors prometheus.Counter
-
-	metricDescriptions map[string]*prometheus.Desc
+	metricDescriptions        map[string]*prometheus.Desc
 
 	options Options
 
@@ -516,6 +516,12 @@ func NewRedisExporter(uri string, opts Options) (*Exporter, error) {
 	} {
 		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
 	}
+	e.metricDescriptions["redis_top_key_memory_usage_bytes"] = newMetricDescr(
+		opts.Namespace,
+		"redis_top_key_memory_usage_bytes",
+		"Memory usage in bytes for Redis keys with highest memory usage",
+		[]string{"db", "key"},
+	)
 
 	if e.options.MetricsPath == "" {
 		e.options.MetricsPath = "/metrics"
@@ -594,6 +600,99 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.totalScrapes
 	ch <- e.scrapeDuration
 	ch <- e.targetScrapeRequestErrors
+}
+
+type keyMemory struct {
+	db     string
+	key    string
+	memory int64
+}
+type keyMemoryHeap []keyMemory
+
+func (h keyMemoryHeap) Len() int           { return len(h) }
+func (h keyMemoryHeap) Less(i, j int) bool { return h[i].memory < h[j].memory }
+func (h keyMemoryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *keyMemoryHeap) Push(x interface{}) {
+	*h = append(*h, x.(keyMemory))
+}
+func (h *keyMemoryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+func parseScanResponse(resp []interface{}) (string, []string, error) {
+	if len(resp) != 2 {
+		return "", nil, fmt.Errorf("invalid SCAN response: %#v", resp)
+	}
+	cursor, err := redis.String(resp[0], nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid SCAN cursor: %s", err)
+	}
+	keys, err := redis.Strings(resp[1], nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid SCAN keys: %s", err)
+	}
+	return cursor, keys, nil
+}
+func (e *Exporter) extractTopKeyMemoryMetrics(ch chan<- prometheus.Metric, c redis.Conn, dbCount int) {
+	var topKeys []keyMemory
+	minHeap := &keyMemoryHeap{}
+	for i := 0; i < dbCount; i++ {
+		dbName := strconv.Itoa(i)
+		if _, err := doRedisCmd(c, "SELECT", dbName); err != nil {
+			log.Errorf("Couldn't select DB %s, err: %s", dbName, err)
+			continue
+		}
+		cursor := "0"
+		for {
+			resp, err := redis.Values(doRedisCmd(c, "SCAN", cursor, "COUNT", "100"))
+			if err != nil {
+				log.Debugf("Scan error: %s", err)
+				break
+			}
+			cursor, keys, err := parseScanResponse(resp)
+			if err != nil {
+				log.Debugf("parseScanResponse error: %s", err)
+				break
+			}
+			// Process each key in the batch
+			for _, key := range keys {
+				mem, err := redis.Int64(doRedisCmd(c, "MEMORY", "USAGE", key))
+				if err != nil {
+					log.Debugf("Couldn't get memory usage for key %s, err: %s", key, err)
+					continue
+				}
+				// Keep only to 10 keys
+				if len(topKeys) < 10 {
+					topKeys = append(topKeys, keyMemory{db: dbName, key: key, memory: mem})
+					if len(topKeys) == 10 {
+						heap.Init(minHeap)
+						for _, k := range topKeys {
+							heap.Push(minHeap, k)
+						}
+					}
+				} else if mem > (*minHeap)[0].memory {
+					heap.Pop(minHeap)
+					heap.Push(minHeap, keyMemory{db: dbName, key: key, memory: mem})
+				}
+			}
+			if cursor == "0" {
+				break
+			}
+
+		}
+	}
+	sortedKeys := make([]keyMemory, 0, minHeap.Len())
+	for minHeap.Len() > 0 {
+		k := heap.Pop(minHeap).(keyMemory)
+		sortedKeys = append([]keyMemory{k}, sortedKeys...) // Prepend to reverse min-heap order
+	}
+	for _, k := range sortedKeys {
+		e.registerConstMetricGauge(ch, "redis_top_key_memory_usage_bytes", float64(k.memory), k.db, k.key)
+	}
 }
 
 func (e *Exporter) extractConfigMetrics(ch chan<- prometheus.Metric, config []interface{}) (dbCount int, err error) {
@@ -800,6 +899,7 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 			}
 		}
 	}
+	e.extractTopKeyMemoryMetrics(ch, c, dbCount)
 
 	return nil
 }
